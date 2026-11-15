@@ -1,0 +1,431 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Legal Compliance Platform — Bangladesh public ltd listed cos
+// Source: Bangladesh Regulatory Mapping v2 (source-reviewed)
+// ─────────────────────────────────────────────────────────────
+
+model Regulator {
+  id          String               @id @default(cuid())
+  code        String               @unique // RJSC, BSEC, DSECSE, NBR, DOL, BB, NDGA
+  name        String // short display name
+  fullName    String // full authority name
+  description String
+  scopeNote   String? // e.g. "banking-company returns apply ONLY to banks"
+  sortOrder   Int                  @default(0)
+  templates   ObligationTemplate[]
+  obligations Obligation[]
+}
+
+// ─────────────────────────────────────────────────────────────
+// Legal instrument registry — the table that fixes the LegalRule
+// disconnect. The engine reads rules from HERE and nowhere else:
+// every rule cites an instrument in this registry by code.
+// Amendments create a NEW VERSION and never edit the old one.
+// ─────────────────────────────────────────────────────────────
+model LegalInstrument {
+  id             String   @id @default(cuid())
+  code           String   @unique // CA-1994, CGC-2018, PDPA-2026…
+  title          String
+  issuingBody    String // Parliament, BSEC, DSE, CSE, Bangladesh Bank…
+  referenceType  String // ACT | ORDINANCE | RULES | NOTIFICATION | CIRCULAR | RULEBOOK
+  reference      String // gazette / circular reference text
+  sourceUrl      String? // primary source (bdlaws, regulator portal)
+  verification   String   @default("UNVERIFIED") // VERIFIED | PARTIAL | UNVERIFIED | PENDING
+  verifiedBy     String?
+  verifiedAt     DateTime?
+  note           String?
+  versions       LegalInstrumentVersion[]
+  createdAt      DateTime @default(now())
+}
+
+// Immutable version rows — an amendment appends a version; existing
+// versions are never edited (enforced by seed + write discipline).
+model LegalInstrumentVersion {
+  id            String   @id @default(cuid())
+  instrumentId  String
+  instrument    LegalInstrument @relation(fields: [instrumentId], references: [id])
+  versionNo     Int
+  label         String // "Original enactment", "Labour (Amendment) Act 2026"…
+  effectiveFrom String // ISO date or year-level precision — never fake precision
+  effectiveTo   String? // null = still current
+  changeNote    String?
+  sourceTier    String // STATUTE | RULES | CIRCULAR | VOLUNTARY
+  status        String   @default("IN_FORCE") // IN_FORCE | SUPERSEDED | PHASED_IN
+  verification  String   @default("UNVERIFIED")
+
+  @@unique([instrumentId, versionNo])
+}
+
+// Statutory requirement catalogue — one row per filing obligation
+// derived from the Bangladesh Regulatory Map (legal basis + source tier
+// + status + verification carried on every row).
+//
+// VERSIONING: the engine's rules are the DATABASE rows and the code
+// holds no definitions. Every rule carries a version number with an
+// effective window — uniqueness is (refCode, version) and a rule's
+// date ranges must never overlap. An edit inserts a NEW version and
+// NEVER updates a row in place; sourceRef records the approval that
+// created the version (change pipeline / verification queue). The
+// loader fetches only versions active on the as-of date, so an old
+// verdict replays exactly against an old date.
+model ObligationTemplate {
+  id             String      @id @default(cuid())
+  tenantId       String
+  refCode        String // e.g. RJSC-AR, BSEC-PSD — unique per VERSION, not per row
+  version        Int         @default(1)
+  effectiveFrom  String      @default("2026-11-15") // ISO date (or year-level) — rule in force from
+  effectiveTo    String? // null = current version
+  sourceRef      String? // provenance for version > 1: change request / verification sign-off
+  regulatorCode  String
+  regulator      Regulator   @relation(fields: [regulatorCode], references: [code])
+  module         String // bounded-context service, e.g. "Companies Act Service"
+  title          String
+  description    String?
+  legalBasis     String // instrument + section
+  legalBasisNote String? // verification caveats
+  sourceTier     String // STATUTE | RULES | CIRCULAR | VOLUNTARY
+  lawStatus      String // IN_FORCE | AMENDED_2026 | PHASED_IN
+  verification   String // VERIFIED | UNVERIFIED | PARTIAL | PENDING
+  forms          String // JSON array of statutory form names
+  cadence        String // ANNUAL | QUARTERLY | MONTHLY | EVENT | ON_CHANGE
+  deadlineRule   String
+  deadlineNote   String?
+  applicableTo   String      @default("ALL") // ALL | BANKS
+
+  // ── Rule layer (engine reads these; definitions reconcile with
+  //    src/lib/catalogue.ts by rule ID) ──
+  instrumentCode   String? // → LegalInstrument.code (single source of citation)
+  trigger          String  @default("CALENDAR") // CALENDAR | EVENT | STATE
+  applicability    String  @default("{}") // JSON predicate evaluated by the gate
+  requiredEvidence String  @default("[]") // JSON array of evidence items
+  deadlineFormula  String  @default("{}") // JSON structured formula (may be unverified)
+  penaltyRef       String? // penalty provision — UNVERIFIED until confirmed in instrument
+  evaluationType   String  @default("DETERMINISTIC") // DETERMINISTIC | DOCUMENTARY | JUDGMENT
+
+  obligations    Obligation[]
+
+  @@unique([tenantId, refCode, version])
+  @@index([tenantId, refCode])
+}
+
+// Review queue — JUDGMENT findings go to an advocate or company
+// secretary for sign-off, with the reasoning and timestamp logged.
+// A sign-off mirrors into the fact store as `judgment.<refCode>` so
+// any past run replays exactly against the facts that existed then.
+model ReviewDecision {
+  id           String   @id @default(cuid())
+  tenantId     String
+  refCode      String
+  runId        String? // the ComplianceRun the reviewed finding came from
+  decision     String // SATISFIED | EXCEPTION_NOTED | ESCALATED
+  reasoning    String
+  decidedBy    String
+  decidedRole  String // Advocate | Company Secretary
+  decidedAt    DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId, refCode])
+}
+
+// Deadline verification queue — every rule that would assert a due
+// date, a penalty or a citation is confirmed against its REGISTERED
+// instrument before it goes in. Confirming a deadline applies the
+// verified formula as a NEW rule version (never in-place) and flips
+// the finding from UNVERIFIED_DEADLINE to a computable due date.
+model RuleVerification {
+  id                  String   @id @default(cuid())
+  tenantId            String
+  refCode             String
+  ruleVersion         Int
+  subject             String // DEADLINE_FORMULA | PENALTY_REF | CITATION
+  claim               String // what the rule currently asserts (unverified)
+  instrumentCode      String
+  instrumentReference String // snapshot of the instrument's gazette/circular reference
+  instrumentSourceUrl String?
+  proposedFormula     String? // JSON — the verified deadline formula
+  proposedNote        String? // citation note, e.g. "s. 133 confirmed on bdlaws"
+  status              String   @default("PENDING") // PENDING | CONFIRMED | REJECTED
+  decidedBy           String?
+  decidedRole         String?
+  decidedAt           DateTime?
+  note                String?
+  createdAt           DateTime @default(now())
+
+  @@index([tenantId, refCode])
+}
+
+// Change pipeline — BSEC/DSE circulars are ingested through a
+// human-approved flow. Each approval creates the new rule version(s)
+// AND records an impact report: which findings flip under the change,
+// computed by running the evaluator before and after. Without this
+// the engine goes stale silently, and a stale GREEN is the worst
+// failure mode.
+model ChangeRequest {
+  id            String   @id @default(cuid())
+  tenantId      String
+  refCode       String // the rule the change targets
+  title         String
+  issuer        String // BSEC | DSE | CSE | RJSC | NBR | BB
+  reference     String // circular/notification number
+  publishedAt   String
+  summary       String
+  proposedFields String // JSON — the field patch this amendment carries
+  effectiveFrom String
+  status        String   @default("RECEIVED") // RECEIVED | UNDER_REVIEW | APPROVED | REJECTED
+  reviewedBy    String?
+  reviewedAt    DateTime?
+  reviewNote    String?
+  impactReport  String? // JSON — findings that flip when approved
+  createdAt     DateTime @default(now())
+
+  @@index([tenantId, refCode])
+}
+
+// Access log — listed-company data includes unpublished price-sensitive
+// information; tenant isolation is a legal exposure and staff access is
+// an insider-trading risk. Every read of sensitive resources is logged
+// with actor, role, outcome (ALLOWED/DENIED) and reason (need-to-know).
+model AccessLog {
+  id            String   @id @default(cuid())
+  tenantId      String
+  at            DateTime @default(now())
+  actor         String
+  role          String
+  action        String // LIST_DOCUMENTS | OPEN_DOCUMENT | UPLOAD_DOCUMENT | RUN_COMPLIANCE_ENGINE | QUERY_ASSISTANT | ROLE_SWITCH
+  resource      String
+  detail        String?
+  classification String // highest classification touched
+  outcome       String // ALLOWED | DENIED
+  reason        String? // need-to-know rationale for the outcome
+
+  @@index([tenantId, at])
+}
+
+// The evaluated company — one profile per tenant (SaaS row-level isolation)
+model CompanyProfile {
+  id           String @id @default(cuid())
+  tenantId     String @unique
+  name         String
+  stockTickers String? // "DSE: PADMATEX · CSE: PADMATEX"
+  sector       String
+  note         String?
+  tenant       Tenant @relation(fields: [tenantId], references: [id])
+}
+
+// Company fact store — every fact carries a source, an as-of date and
+// who verified it. Overrides (consents / exemptions) are fact-level rows
+// scoped to a single rule ID. The evaluator is a pure function of
+// (facts, rules, as-of date) so any past finding replays exactly.
+model CompanyFact {
+  id           String   @id @default(cuid())
+  tenantId     String
+  type         String   @default("FACT") // FACT | OVERRIDE
+  key          String // company_type, exchange, category, last_agm_date, evidence.*
+  value        String
+  scopeRefCode String? // overrides: the rule this consent/exemption applies to
+  source       String
+  asOf         String // ISO date — fact valid from this date
+  verifiedBy   String?
+  note         String?
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId, key, asOf])
+}
+
+// Persisted evaluation runs — audit trail of the pure-function evaluator
+model ComplianceRun {
+  id           String   @id @default(cuid())
+  tenantId     String
+  asOf         String // evaluation as-of date (ISO)
+  summary      String // JSON summary blob (score, counts)
+  factSnapshot String // JSON fact state used — exact replay of any past run
+  createdAt    DateTime @default(now())
+  findings     ComplianceFinding[]
+
+  @@index([tenantId, asOf])
+}
+
+// One finding per applicable rule per run
+model ComplianceFinding {
+  id              String @id @default(cuid())
+  tenantId        String // defense-in-depth: findings also carry the tenant stamp
+  runId           String
+  run             ComplianceRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  refCode         String
+  title           String
+  regulatorCode   String
+  evaluationType  String // DETERMINISTIC | DOCUMENTARY | JUDGMENT
+  trigger         String
+  status          String // OVERDUE | DUE_SOON | UPCOMING | EVENT_DRIVEN | UNVERIFIED_DEADLINE | EVIDENCE_PRESENT | EVIDENCE_MISSING | JUDGMENT_REQUIRED | NOT_APPLICABLE | EXEMPT
+  dueDate         String? // computed due date (ISO) when determinable
+  gateTrace       String // JSON array of gate steps + outcomes
+  reason          String // human-readable explanation citing instrument
+  ruleVerification String // source-review status of the rule row
+  ruleVersion     Int     @default(1) // the rule version that produced the finding
+  instrumentCode  String?
+
+  @@index([tenantId, refCode])
+}
+
+// Live obligation instance tracked for the demo listed company
+model Obligation {
+  id            String     @id @default(cuid())
+  tenantId      String
+  templateId    String?
+  template      ObligationTemplate? @relation(fields: [templateId], references: [id])
+  refCode       String?
+  title         String
+  regulatorCode String
+  regulator     Regulator  @relation(fields: [regulatorCode], references: [code])
+  forms         String? // JSON array
+  cadence       String
+  periodLabel   String? // e.g. "FY2025-26", "Q2 FY2026-27", "Nov 2026"
+  dueDate       DateTime
+  // Workflow engine state machine: DRAFT → IN_PROGRESS → IN_REVIEW → APPROVED → FILED
+  status        String     @default("DRAFT")
+  priority      String     @default("MEDIUM") // HIGH | MEDIUM | LOW
+  assignee      String
+  company       String     @default("Padma Textiles & Apparels Ltd.")
+  notes         String?
+  filedAt       DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  documents     Document[]
+  activities    Activity[]
+
+  @@index([tenantId, dueDate])
+}
+
+// Document Vault — versioned, classified evidence items
+model Document {
+  id           String     @id @default(cuid())
+  tenantId     String
+  obligationId String?
+  obligation   Obligation? @relation(fields: [obligationId], references: [id], onDelete: Cascade)
+  name         String
+  classification String   @default("INTERNAL") // PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED
+  version      Int        @default(1)
+  fileType     String     @default("PDF")
+  sizeKb       Int        @default(0)
+  uploadedBy   String     @default("Nusrat Jahan")
+  createdAt    DateTime   @default(now())
+
+  @@index([tenantId, createdAt])
+}
+
+// Audit & e-Sign trail — tamper-evident activity log
+model Activity {
+  id           String     @id @default(cuid())
+  tenantId     String
+  obligationId String?
+  obligation   Obligation? @relation(fields: [obligationId], references: [id], onDelete: Cascade)
+  type         String // CREATED | STATUS_CHANGE | COMMENT | DOCUMENT_UPLOADED | FILED | UPDATED
+  actor        String
+  message      String
+  createdAt    DateTime   @default(now())
+
+  @@index([tenantId, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// SaaS layer — tenants, users (NextAuth), engine-health alerts.
+// Regulator / LegalInstrument / LegalInstrumentVersion remain GLOBAL
+// (the law is the same for every tenant); every DOMAIN row carries a
+// tenantId and is isolated by the tenant-scoped Prisma client.
+// ─────────────────────────────────────────────────────────────
+
+model Tenant {
+  id            String   @id @default(cuid())
+  name          String // "Padma Textiles & Apparels Ltd."
+  slug          String   @unique // "padma-textiles" — stable handle for logins/URLs
+  plan          String   @default("STANDARD") // PILOT | STANDARD | ENTERPRISE
+  status        String   @default("ACTIVE") // ACTIVE | SUSPENDED — suspension is the kill switch
+  dataResidency String   @default("BD") // regulatory note: data held in Bangladesh
+  createdAt     DateTime @default(now())
+  users         User[]
+  profiles      CompanyProfile[]
+}
+
+// NextAuth v4 user — provisioned by an administrator (no JIT signup):
+// every user belongs to exactly one tenant and carries exactly one of
+// the need-to-know roles. SSO (Google / Azure AD / Okta OIDC) links by
+// verified email to a PROVISIONED user — unprovisioned emails are
+// rejected at sign-in, never auto-created.
+model User {
+  id            String    @id @default(cuid())
+  tenantId      String
+  tenant        Tenant    @relation(fields: [tenantId], references: [id])
+  name          String
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String? // null = SSO-only sign-in
+  role          String // RoleId — the need-to-know clearance ladder
+  active        Boolean   @default(true) // deactivation flips sign-in + all sessions off
+  createdAt     DateTime  @default(now())
+  accounts      Account[]
+  sessions      Session[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expires      DateTime
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// Engine-health alerting — the engine must never go stale silently.
+// A run that finds an ENGINE_GAP, a rule left unverified too long, or a
+// circular pending decision raises an OPEN alert (deduplicated per
+// type+refCode) and notifies the configured webhook; when the condition
+// clears, the alert is resolved with a timestamp.
+model EngineAlert {
+  id         String    @id @default(cuid())
+  tenantId   String
+  type       String // ENGINE_GAP | RULE_UNVERIFIED_STALE | CHANGE_PENDING
+  refCode    String? // the rule (or change request reference) the alert is about
+  severity   String // INFO | WARN | CRITICAL
+  message    String
+  status     String    @default("OPEN") // OPEN | RESOLVED
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  resolvedAt DateTime?
+  notifiedAt DateTime?
+
+  @@index([tenantId, status, createdAt])
+}

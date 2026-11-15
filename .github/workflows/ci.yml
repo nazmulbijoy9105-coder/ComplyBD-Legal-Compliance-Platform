@@ -1,0 +1,97 @@
+# ComplyBD CI — quality gate + Postgres compatibility.
+#
+# Job 1 (quality): install → lint → typecheck → SQLite db push → seed
+#   (the seed FAILS the job if its catalogue reconciliation self-check
+#   finds any drift) → tenant-isolation checks → production build.
+# Job 2 (postgres-compat): derives prisma/schema.postgres.prisma from the
+#   canonical schema, generates the Postgres client and pushes the schema
+#   into a real Postgres 16 service, then runs the seed against it —
+#   proving the portable model layer on the production database engine.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    name: Lint · Typecheck · Seed reconciliation · Isolation · Build
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: file:./db/ci.db
+      NEXTAUTH_SECRET: ci-secret-not-a-production-value
+      NEXTAUTH_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile || bun install
+
+      - name: Prisma generate (SQLite client)
+        run: bunx prisma generate
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Push schema (SQLite)
+        run: bunx prisma db push --accept-data-loss --force-reset
+
+      - name: Seed + catalogue reconciliation self-check
+        run: bun run db:seed
+
+      - name: Tenant-isolation checks
+        run: bun run verify:isolation
+
+      - name: Production build
+        run: bun run build
+
+  postgres-compat:
+    name: Postgres 16 schema push + seed
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: complybd
+          POSTGRES_PASSWORD: complybd-ci
+          POSTGRES_DB: complybd
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U complybd"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://complybd:complybd-ci@localhost:5432/complybd
+      NEXTAUTH_SECRET: ci-secret-not-a-production-value
+      NEXTAUTH_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile || bun install
+
+      - name: Derive Postgres schema + generate client
+        run: bun run db:generate:pg
+
+      - name: Push schema to Postgres
+        run: bunx prisma db push --schema prisma/schema.postgres.prisma
+
+      - name: Seed against Postgres (reconciliation must pass there too)
+        run: bun run db:seed
+
+      - name: Tenant-isolation checks on Postgres
+        run: bun run verify:isolation
