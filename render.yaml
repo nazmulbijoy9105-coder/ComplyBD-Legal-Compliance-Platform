@@ -8,13 +8,16 @@ services:
     runtime: node
     plan: starter
     healthCheckPath: /api/dashboard
-    # Install with bun, push the Prisma schema to the SQLite file, then run
-    # the standalone Next production build (package.json "build" script).
+    # Install with bun, push the Prisma schema to the SQLite file on the
+    # persistent disk, then run the standalone Next production build.
+    # The build script itself generates the correct Prisma client (it reads
+    # DATABASE_URL: sqlite here, postgres://… for the Postgres topology), so
+    # even a bare `npm run build` can no longer fail with
+    # "Cannot find module '.prisma/client/default'".
     buildCommand: bun install && bunx prisma generate && bunx prisma db push && npm run build
-    # Boots the standalone server via the package.json "start" script.
-    # Caveat: that script invokes `bun .next/standalone/server.js` — bun must
-    # exist on the image (Render's node runtime doesn't ship it by default).
-    # If bun is unavailable, set startCommand to: node .next/standalone/server.js
+    # Boots the standalone server via the package.json "start" script, which
+    # runs `node .next/standalone/server.js` — plain Node, no bun required at
+    # runtime. PORT / HOSTNAME are picked up from Render's environment.
     startCommand: npm run start
     disk:
       name: complybd-data

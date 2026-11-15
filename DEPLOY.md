@@ -76,11 +76,18 @@ Render runs the entire app (frontend + API routes) as one Node Web Service, and 
    you delete the service or resize/remove the disk).
 3. Deploy. The build command runs `bun install && bunx prisma generate && bunx prisma
    db push && npm run build`, then starts the app.
-   - **Caveat:** Render's Node runtime image may not include `bun`. If the build
-     fails on the bun step, switch the Blueprint's `buildCommand` to the npm
-     equivalent — `npm install && npx prisma generate && npx prisma db push && npm run
-     build` — and `startCommand` to `node .next/standalone/server.js`. The app runs
-     fine on plain Node; bun is only used as the installer/runner.
+   - **Client generation is fail-safe.** The package now generates the Prisma
+     client in a `postinstall` hook *and* at the start of `npm run build`
+     (`scripts/prisma-generate-for-env.ts` reads `DATABASE_URL` and generates the
+     matching client — SQLite for this topology, Postgres for Options B/C). Even
+     a Render service configured with a bare `npm run build` builds correctly.
+   - **`prisma db push` still belongs in the Render build command** — it applies
+     the schema to the SQLite file on the persistent disk (a fresh disk starts
+     empty; a redeploy with schema changes migrates in place). Set the Render
+     **Build Command** to the full sequence above if the service was created
+     manually instead of from the Blueprint.
+   - The start script runs `node .next/standalone/server.js` — plain Node, no
+     bun required at runtime (bun is only the build-time installer/runner).
 4. **First-boot seeding** — the database starts empty. Seed it once, either:
    - from the Render **Shell** tab (SSH into the starter instance):
      `bun prisma/seed.ts` (or `npx tsx prisma/seed.ts` without bun), or
@@ -110,9 +117,10 @@ The Next.js app — **including every API route** (`/api/dashboard`, `/api/expor
      (`postgresql://user:password@host:5432/complybd?sslmode=require`);
    - run `bunx prisma db push --schema prisma/schema.postgres.prisma` once and
      `bun prisma/seed.ts` once to load the dataset;
-   - commit and redeploy (Vercel's build runs `prisma generate`, which uses the
-     last-generated client — keep the generated client in git or run
-     `db:generate:pg` in the build command).
+   - set the Vercel **Build Command** to `bun run build` — the build script
+     detects the `postgres://` URL and generates the **Postgres** client
+     automatically (a SQLite-flavoured client pointed at Postgres fails at
+     runtime, which is the classic deploy-late failure this prevents).
 
 ## 5. Option C — Split topology (Vercel app + Render Postgres)
 
@@ -153,7 +161,27 @@ any real deployment**). SSO emails must match a provisioned user — nothing is
 auto-created. Without a session the sandbox still offers the clearly-badged DEMO
 persona switcher (cookie role) inside the demo tenant.
 
-## 7. Post-deploy checklist
+## 7. Troubleshooting deploys
+
+- **Build fails with `Cannot find module '.prisma/client/default'`** (Render log:
+  `Failed to load external module @prisma/client-…`, then
+  `Failed to collect page data for /api/reconciliation`) — the Prisma client was
+  never generated on the build machine. The repository now fixes this at two
+  layers: a `postinstall` hook runs `prisma generate` after every install, and
+  `npm run build` regenerates the correct client first. Make sure the deployed
+  commit includes that fix; if a manually-created Render service still fails,
+  set its Build Command to
+  `bun install && bunx prisma generate && bunx prisma db push && npm run build`.
+- **`Failed to collect page data`** for an API route — almost always the Prisma
+  client missing/mismatched at build time (see above), not a bug in that route.
+- **Runtime 500s on a fresh Render disk** — the database was never seeded. Run
+  the seed once via the Render Shell or a one-off Job (Option A step 4).
+- **Build fails on a Postgres deployment with SQLite/Postgres engine mismatch**
+  — the build must run `bun run build` (which detects the `postgres://` URL and
+  generates the Postgres client), not a bare `next build` that reuses a stale
+  SQLite-flavoured client.
+
+## 8. Post-deploy checklist
 
 Hit these endpoints (they should all return **200**) and open the dashboard:
 

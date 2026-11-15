@@ -32,11 +32,12 @@ export interface AuthSession {
   name?: string | null
   email?: string | null
   role?: string
+  tenantName?: string | null
 }
 
-/** NextAuth session payload shape: { user: { id, name, email, role… }, expires }. */
+/** NextAuth session payload shape: { user: { id, name, email, role, tenantName… }, expires }. */
 interface NextAuthSessionPayload {
-  user?: { id?: string; name?: string | null; email?: string | null; role?: string }
+  user?: { id?: string; name?: string | null; email?: string | null; role?: string; tenantName?: string | null }
   expires?: string
 }
 
@@ -56,6 +57,7 @@ export function useAuthSession() {
           name: data.user.name,
           email: data.user.email,
           role: data.user.role,
+          tenantName: data.user.tenantName,
         })
       } else {
         setSession({ authenticated: false })
